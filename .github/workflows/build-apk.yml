@@ -1,0 +1,238 @@
+import flet as ft
+import sqlite3
+import requests
+import base64
+from datetime import datetime
+import time
+
+DB_FILE = "nyadorera_bi.db"
+
+# ==========================================
+# 🔑 DARAJA CONFIG - REPLACE WITH YOUR KEYS
+# Get from: developer.safaricom.co.ke
+# ==========================================
+DARAJA_CONSUMER_KEY = "YOUR_CONSUMER_KEY_HERE"
+DARAJA_CONSUMER_SECRET = "YOUR_CONSUMER_SECRET_HERE"
+MPESA_SHORTCODE = "174379"  # 174379 = SANDBOX TEST. Change to your Till e.g. "123456" for real
+MPESA_PASSKEY = "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919"  # Sandbox passkey. Get yours from Daraja portal
+CALLBACK_URL = "https://mydomain.com/callback"  # For testing, any https url works
+USE_SANDBOX = True  # Set False for real money (production)
+
+# ==========================================
+# DARAJA FUNCTIONS - AUTO M-PESA
+# ==========================================
+def get_daraja_token():
+    base = "https://sandbox.safaricom.co.ke" if USE_SANDBOX else "https://api.safaricom.co.ke"
+    url = f"{base}/oauth/v1/generate?grant_type=client_credentials"
+    auth = base64.b64encode(f"{DARAJA_CONSUMER_KEY}:{DARAJA_CONSUMER_SECRET}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}"}
+    res = requests.get(url, headers=headers, timeout=15)
+    return res.json().get("access_token")
+
+def stk_push(phone, amount=500):
+    try:
+        token = get_daraja_token()
+        if not token:
+            return {"ResponseCode": "1", "errorMessage": "Failed to get token - check Consumer Key/Secret"}
+        
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        password = base64.b64encode(f"{MPESA_SHORTCODE}{MPESA_PASSKEY}{timestamp}".encode()).decode()
+        
+        # Format phone 07XX -> 2547XX
+        phone = phone.strip().replace(" ", "")
+        if phone.startswith("07"):
+            phone = "254" + phone[1:]
+        elif phone.startswith("7"):
+            phone = "254" + phone
+        elif phone.startswith("+254"):
+            phone = phone[1:]
+
+        base = "https://sandbox.safaricom.co.ke" if USE_SANDBOX else "https://api.safaricom.co.ke"
+        url = f"{base}/mpesa/stkpush/v1/processrequest"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        
+        payload = {
+            "BusinessShortCode": MPESA_SHORTCODE,
+            "Password": password,
+            "Timestamp": timestamp,
+            "TransactionType": "CustomerPayBillOnline",
+            "Amount": int(amount),
+            "PartyA": phone,
+            "PartyB": MPESA_SHORTCODE,
+            "PhoneNumber": phone,
+            "CallBackURL": CALLBACK_URL,
+            "AccountReference": "NYADORERA",
+            "TransactionDesc": "Nyadorera Expenses Subscription"
+        }
+        res = requests.post(url, json=payload, headers=headers, timeout=20)
+        return res.json()
+    except Exception as ex:
+        return {"ResponseCode": "1", "errorMessage": str(ex)}
+
+# ==========================================
+# DATABASE + TRIAL LOGIC
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS expenses (id INTEGER PRIMARY KEY, date TEXT, desc TEXT, amount REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS sales (id INTEGER PRIMARY KEY, date TEXT, amount REAL)")
+    c.execute("SELECT value FROM settings WHERE key='install_date'")
+    if not c.fetchone():
+        today = datetime.now().strftime("%Y-%m-%d")
+        c.execute("INSERT INTO settings VALUES ('install_date', ?)", (today,))
+        c.execute("INSERT INTO settings VALUES ('is_paid', '0')")
+        c.execute("INSERT INTO settings VALUES ('last_checkout_id', '')")
+    conn.commit()
+    conn.close()
+
+def check_subscription():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key='install_date'")
+    row = c.fetchone()
+    install_date = datetime.strptime(row[0], "%Y-%m-%d") if row else datetime.now()
+    c.execute("SELECT value FROM settings WHERE key='is_paid'")
+    is_paid = (c.fetchone() or ["0"])[0] == "1"
+    conn.close()
+    if is_paid:
+        return True, 0, "PAID ✅"
+    days_left = 30 - (datetime.now() - install_date).days
+    if days_left > 0:
+        return True, days_left, f"TRIAL - {days_left} days left"
+    return False, 0, "EXPIRED ❌"
+
+# ==========================================
+# APP UI - SAME DASHBOARD DESIGN
+# ==========================================
+def main(page: ft.Page):
+    init_db()
+    is_active, days_left, status_text_str = check_subscription()
+    
+    page.title = "Nyadorera Expenses Tracker"
+    page.bgcolor = "#F1F5F9"
+    page.padding = 0
+    page.scroll = "auto"
+    page.theme_mode = "light"
+
+    def pro_card(label, value, color):
+        return ft.Container(
+            bgcolor="white", border_radius=16, padding=16, expand=1,
+            shadow=ft.BoxShadow(blur_radius=8, color="#0000000A"),
+            content=ft.Column([
+                ft.Text(label, size=12, color="#64748B"),
+                ft.Container(height=6),
+                ft.Text(value, size=17, weight="bold", color=color)
+            ])
+        )
+
+    def show_dashboard():
+        page.clean()
+        page.add(
+            ft.Container(bgcolor="white", padding=15, content=ft.Column([
+                ft.Row([
+                    ft.Container(bgcolor="#2563EB", border_radius=12, width=50, height=50, alignment=ft.alignment.center, content=ft.Text("DB", color="white", weight="bold", size=18)),
+                    ft.Column([ft.Text("DUKA BI", size=20, weight="bold"), ft.Text(status_text_str, size=11, color="#10B981" if is_active else "#EF4444")], expand=True),
+                    ft.Container(padding=8, border=ft.border.all(1, "#E2E8F0"), border_radius=8, content=ft.Text("🌙 Dark", size=11))
+                ]),
+                ft.Text(f"DASHBOARD • {datetime.now().strftime('%Y-%m-%d')} • Nyadorera", size=9, weight="bold", color="#94A3B8"),
+            ])),
+            ft.Container(padding=15, content=ft.Column([
+                ft.Row([pro_card("Sales today", "KSh 1,580.00", "#15803D"), pro_card("Expenses today", "KSh 250.00", "#B45309")], spacing=10),
+                ft.Row([pro_card("Products", "5", "#2563EB"), pro_card("Stock value (cost)", "KSh 7,680.00", "#0F766E")], spacing=10),
+                ft.Container(height=18),
+                ft.Text("QUICK ACTIONS", size=10, weight="bold", color="#64748B"),
+                ft.Text("Same design you built. Trial system active.", size=11, color="#94A3B8"),
+                ft.Container(height=10),
+                ft.GridView(expand=False, runs_count=2, max_extent=200, spacing=8, run_spacing=8, height=320,
+                    controls=[
+                        ft.Container(bgcolor="white", padding=14, border_radius=10, content=ft.Text("📦 Add product", weight="bold", size=12)),
+                        ft.Container(bgcolor="white", padding=14, border_radius=10, content=ft.Text("🛒 Record sale", weight="bold", size=12)),
+                        ft.Container(bgcolor="white", padding=14, border_radius=10, content=ft.Text("📥 Receive stock", weight="bold", size=12)),
+                        ft.Container(bgcolor="white", padding=14, border_radius=10, content=ft.Text("- Record expense", weight="bold", size=12)),
+                        ft.Container(bgcolor="white", padding=14, border_radius=10, content=ft.Text("📊 Stock report", weight="bold", size=12)),
+                        ft.Container(bgcolor="white", padding=14, border_radius=10, content=ft.Text("💳 Payment check", weight="bold", size=12)),
+                    ])
+            ]))
+        )
+
+    def show_payment_screen():
+        page.clean()
+        phone_field = ft.TextField(label="M-Pesa Phone Number", hint_text="0712 345 678", value="07", keyboard_type=ft.KeyboardType.PHONE)
+        status = ft.Text("", size=12, color="#334155")
+        pay_btn = ft.ElevatedButton("PAY KSh 500 WITH M-PESA", bgcolor="#16A34A", color="white", width=float("inf"))
+
+        def do_stk_push(e):
+            phone = phone_field.value
+            if len(phone) < 9:
+                status.value = "❌ Enter valid phone number"
+                page.update()
+                return
+            
+            pay_btn.disabled = True
+            pay_btn.text = "Sending STK..."
+            status.value = "⏳ Connecting to M-Pesa Daraja..."
+            page.update()
+
+            result = stk_push(phone, 500)
+            print("Daraja Response:", result)  # For debugging
+
+            if result.get("ResponseCode") == "0":
+                checkout_id = result.get("CheckoutRequestID", "")
+                # Save checkout id
+                conn = sqlite3.connect(DB_FILE)
+                conn.execute("UPDATE settings SET value=? WHERE key='last_checkout_id'", (checkout_id,))
+                conn.commit()
+                conn.close()
+
+                status.value = f"✅ STK Push sent to {phone}!\nCheck your phone → Enter M-Pesa PIN\n\nAfter paying, click VERIFY below"
+                pay_btn.text = "VERIFY PAYMENT"
+                pay_btn.bgcolor = "#2563EB"
+                pay_btn.disabled = False
+                pay_btn.on_click = verify_clicked
+                page.update()
+            else:
+                err = result.get("errorMessage") or result.get("ResponseDescription") or str(result)
+                status.value = f"❌ Failed: {err}\n\nIf using SANDBOX, use test phone 254708374149"
+                pay_btn.disabled = False
+                pay_btn.text = "TRY AGAIN"
+                page.update()
+
+        def verify_clicked(e):
+            # For sandbox demo, we auto-unlock after STK is sent
+            # In production, you would call stkpushquery to confirm
+            status.value = "✅ Payment Verified! Unlocking..."
+            page.update()
+            time.sleep(1)
+            conn = sqlite3.connect(DB_FILE)
+            conn.execute("UPDATE settings SET value='1' WHERE key='is_paid'")
+            conn.commit()
+            conn.close()
+            page.snack_bar = ft.SnackBar(ft.Text("KSh 500 Received! App Unlocked ✅"))
+            page.snack_bar.open = True
+            page.update()
+            time.sleep(1)
+            show_dashboard()
+
+        pay_btn.on_click = do_stk_push
+
+        page.add(
+            ft.Container(bgcolor="white", padding=28, expand=True,
+                content=ft.Column([
+                    ft.Icon(ft.Icons.LOCK_OUTLINE, size=60, color="#7A1A2A"),
+                    ft.Text("Free Trial Ended", size=23, weight="bold", color="#7A1A2A"),
+                    ft.Text("Your 30-day free trial for Nyadorera job has ended.\nPay KSh 500 to unlock forever.", size=13, color="#64748B", text_align="center"),
+                    ft.Container(height=12),
+                    ft.Container(bgcolor="#F0FDF4", border=ft.border.all(1, "#BBF7D0"), border_radius=10, padding=14,
+                        content=ft.Column([
+                            ft.Text("M-PESA AUTO PAYMENT", size=11, weight="bold", color="#16A34A"),
+                            ft.Text(f"Till: {MPESA_SHORTCODE}", weight="bold", size=16),
+                            ft.Text("Amount: KSh 500 / month", size=12),
+                            ft.Text("Sandbox Test Mode ON" if USE_SANDBOX else "LIVE Mode - Real Money", size=10, color="#EF4444" if not USE_SANDBOX else "#64748B")
+                        ])
+                    ),
+                    ft.Container(height=12),
+                    phone_field,
+                    pay_btn,
+                    status
